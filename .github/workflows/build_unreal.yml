@@ -1,0 +1,64 @@
+name: Build Luma Unreal Engine Mod
+
+on:
+  push:
+    paths:
+      - 'Shaders/Unreal Engine/**'
+  workflow_dispatch:
+
+jobs:
+  build-unreal-mod:
+    name: Build Unreal Engine mod artifacts
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Ensure zip is available
+        run: sudo apt-get update && sudo apt-get install -y zip
+
+      - name: Create artifacts directory
+        run: mkdir -p artifacts
+
+      - name: Create full Luma-Unreal_Engine.zip
+        run: |
+          set -e
+          if [ -d "Shaders/Unreal Engine" ]; then
+            zip -r artifacts/Luma-Unreal_Engine.zip "Shaders/Unreal Engine"
+            echo "Created artifacts/Luma-Unreal_Engine.zip"
+          else
+            echo "Directory 'Shaders/Unreal Engine' not found"; exit 1
+          fi
+
+      - name: Create Luma-Unreal_Engine-Test.zip (small-files test bundle)
+        run: |
+          python3 - <<'PY'
+import os, zipfile
+root = 'Shaders/Unreal Engine'
+out = 'artifacts/Luma-Unreal_Engine-Test.zip'
+if not os.path.isdir(root):
+    raise SystemExit("Directory not found: %s" % root)
+with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as z:
+    for dirpath, dirs, files in os.walk(root):
+        for f in files:
+            fp = os.path.join(dirpath, f)
+            try:
+                size = os.path.getsize(fp)
+            except OSError:
+                continue
+            # Include only small files in the test bundle to keep it lightweight
+            if size <= 200_000:
+                arcname = os.path.relpath(fp, root)
+                z.write(fp, arcname)
+print('Created', out)
+PY
+
+      - name: List created artifacts
+        run: ls -lah artifacts || true
+
+      - name: Upload mod artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Luma-Unreal-Engine-artifacts
+          path: artifacts/*.zip
