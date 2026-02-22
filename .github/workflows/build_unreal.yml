@@ -1,6 +1,7 @@
-name: Build Unreal Engine Mod
+name: Build Unreal Engine Artifacts
 
 on:
+  workflow_dispatch:
   push:
     branches: [ main ]
   pull_request:
@@ -11,129 +12,119 @@ jobs:
     runs-on: windows-latest
     strategy:
       matrix:
-        config: [Test-Release, Publishing-Release]
-        platform: [x64]
+        include:
+          - config: Publishing-Release
+            artifact_suffix: Release
+          - config: Test-Release
+            artifact_suffix: Test
 
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      with:
-        submodules: recursive
-        fetch-depth: 0
-
-    - name: Setup MSBuild
-      uses: microsoft/setup-msbuild@v1.1.2
-
-    - name: Clone vcpkg
-      run: git clone https://github.com/microsoft/vcpkg.git
-
-    - name: Bootstrap vcpkg
-      run: .\vcpkg\bootstrap-vcpkg.bat
-
-    - name: Integrate vcpkg with MSBuild
-      run: .\vcpkg\vcpkg integrate install
-
-    - name: Build ReShade.sln Release
-      run: msbuild "Source\External\reshade\ReShade.sln" /p:Configuration="Release" /p:Platform="64-bit"
-
-    - name: Build Unreal Engine addon
-      run: |
-        msbuild "Source\Games\Unreal Engine\Unreal Engine.vcxproj" /p:Configuration=${{ matrix.config }} /p:Platform=${{ matrix.platform }} /p:DefineConstants="REMOTE_BUILD=1"
-
-    - name: Package Unreal Engine
-      id: create_zip
-      shell: pwsh
-      if: matrix.config == 'Publishing-Release' || matrix.config == 'Test-Release'
-      run: |
-        $projectName = 'Unreal Engine'
-        $addonDir = "Binaries\${{ matrix.platform }}-${{ matrix.config }}"
-        $addonFile = Join-Path $addonDir "Luma-$projectName.addon"
-        if (-not (Test-Path $addonFile)) {
-          Write-Host "Addon missing at $addonFile"
-          "skip_upload=true" >> $env:GITHUB_OUTPUT
-          exit 0
-        }
-
-        $zipName = "Luma-$projectName"
-        if ("${{ matrix.config }}" -eq 'Test-Release') {
-          $zipName += '-Test'
-        }
-        $zipName = $zipName -replace ' ', '_'
-        $zipName += '.zip'
-
-        $tempDir = 'temp_package'
-        Remove-Item -Recurse -Force $tempDir -ErrorAction SilentlyContinue
-        New-Item -ItemType Directory -Path "$tempDir/Luma" -Force | Out-Null
-
-        $shaderRoot = Join-Path $tempDir 'Luma'
-        $allowedDirs = @('Global', 'Includes', $projectName)
-        foreach ($dir in $allowedDirs) {
-          $source = Join-Path 'Shaders' $dir
-          if (Test-Path $source) {
-            Copy-Item -Path $source -Destination $shaderRoot -Recurse
-          }
-        }
-
-        $allowedExtensions = @('.hlsl', '.hlsli')
-        Get-ChildItem -Path $shaderRoot -Recurse -File | ForEach-Object {
-          if ($allowedExtensions -notcontains $_.Extension.ToLower()) {
-            Remove-Item $_.FullName -Force
-          }
-        }
-
-        Copy-Item -Path "Shaders/Decompiler/d3dcompiler_47.dll" -Destination "$tempDir/Luma"
-
-        $rsSrc = 'Source/External/reshade/bin/x64/Release/ReShade64.dll'
-        if (Test-Path $rsSrc) {
-          Copy-Item -Path $rsSrc -Destination (Join-Path $tempDir 'dxgi.dll') -Force
-        }
-
-        if (Test-Path 'Source/External/NGX/bin/rel/nvngx_dlss.dll') {
-          Copy-Item -Path 'Source/External/NGX/bin/rel/nvngx_dlss.dll' -Destination $tempDir -Force
-        }
-
-        Copy-Item -Path $addonFile -Destination (Join-Path $tempDir "Luma-$projectName.addon")
-
-        Compress-Archive -Path "$tempDir/*" -DestinationPath $zipName -Force
-        Remove-Item -Recurse -Force $tempDir
-
-        Write-Host "Packaged $zipName"
-        "zipfile=$zipName" >> $env:GITHUB_OUTPUT
-        "skip_upload=false" >> $env:GITHUB_OUTPUT
-
-    - name: Upload Unreal Engine package
-      if: steps.create_zip.outputs.skip_upload != 'true'
-      uses: actions/upload-artifact@v4
-      with:
-        name: Package-${{ matrix.config }}-${{ matrix.platform }}
-        path: ${{ steps.create_zip.outputs.zipfile }}
-
-  release:
-    runs-on: ubuntu-latest
-    needs: build-unreal
-    env:
-      GITHUB_TOKEN: ${{ secrets.GH_PAT }}
-    steps:
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
         with:
-          pattern: Package-*
-          merge-multiple: true
+          submodules: recursive
+          fetch-depth: 0
 
-      - name: Create release
-        uses: softprops/action-gh-release@v2
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v1.1.2
+
+      - name: Clone vcpkg
+        run: git clone https://github.com/microsoft/vcpkg.git
+
+      - name: Bootstrap vcpkg
+        run: .\vcpkg\bootstrap-vcpkg.bat
+
+      - name: Install vcpkg packages (Prey manifest)
+        run: .\vcpkg\vcpkg install --triplet x64-windows --x-manifest-root=./Source/Games/Prey
+        continue-on-error: true
+
+      - name: Integrate vcpkg with MSBuild
+        run: .\vcpkg\vcpkg integrate install
+
+      - name: Build Luma.sln x64-${{ matrix.config }}
+        run: msbuild Luma.sln /p:Configuration=${{ matrix.config }} /p:Platform=x64 /p:DefineConstants="REMOTE_BUILD=1"
+
+      - name: Package Unreal Engine addon (no ReShade)
+        id: package
+        shell: pwsh
+        run: |
+          $addonDir = "Binaries\x64-${{ matrix.config }}"
+          $addonFile = Get-ChildItem -Path $addonDir -Filter "Luma-*Unreal Engine*.addon" -ErrorAction SilentlyContinue | Select-Object -First 1
+
+          if (-not $addonFile) {
+            Write-Error "Unreal Engine addon not found in $addonDir"
+            exit 1
+          }
+
+          $fileName = $addonFile.Name
+          $cleanFileName = $fileName -replace '^Luma-_', 'Luma-'
+          $projectName = $cleanFileName -replace '^Luma-', '' -replace '\.addon$', ''
+
+          $zipName = "Luma-$projectName"
+          if ("${{ matrix.config }}" -eq "Test-Release") {
+            $zipName += "-Test"
+          }
+          $zipName = $zipName -replace ' ', '_'
+          $zipName += ".zip"
+
+          $tempDir = "temp_package_unreal"
+          Remove-Item -Recurse -Force $tempDir -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path "$tempDir/Luma" -Force | Out-Null
+
+          Copy-Item -Path "Shaders/*" -Destination "$tempDir/Luma" -Recurse
+
+          $allowedDirs = @("Global", "Includes", $projectName)
+          $allowedExtensions = @(".hlsl", ".hlsli")
+          $shaderRoot = Join-Path $tempDir "Luma"
+
+          Get-ChildItem -Path $shaderRoot -Directory | ForEach-Object {
+            if ($allowedDirs -notcontains $_.Name) {
+              Remove-Item $_.FullName -Recurse -Force
+            } else {
+              $foldersToDelete = @("Unused", "Dev", "Sample")
+              foreach ($folder in $foldersToDelete) {
+                $target = Join-Path $_.FullName $folder
+                if (Test-Path $target) {
+                  Remove-Item $target -Recurse -Force
+                }
+              }
+            }
+          }
+
+          Get-ChildItem -Path $shaderRoot -Recurse -File | ForEach-Object {
+            if ($allowedExtensions -notcontains $_.Extension.ToLower()) {
+              Remove-Item $_.FullName -Force
+            }
+          }
+
+          Copy-Item -Path "Shaders/Decompiler/d3dcompiler_47.dll" -Destination "$tempDir/Luma"
+
+          Write-Host "Skipping ReShade bundling for Unreal artifacts."
+
+          $ngxSrc = "Source/External/NGX/bin/rel/nvngx_dlss.dll"
+          if (Test-Path $ngxSrc) {
+            Copy-Item -Path $ngxSrc -Destination $tempDir -Force
+          } else {
+            Write-Host "NGX DLSS DLL not found at $ngxSrc — skipping"
+          }
+
+          Copy-Item -Path $addonFile.FullName -Destination (Join-Path $tempDir $cleanFileName)
+
+          Compress-Archive -Path "$tempDir/*" -DestinationPath "$zipName" -Force
+          Remove-Item -Recurse -Force $tempDir
+
+          "zip_file=$zipName" >> $env:GITHUB_OUTPUT
+
+      - name: Upload Release artifact
+        if: matrix.artifact_suffix == 'Release'
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: unreal-raw-${{ github.run_number }}
-          name: Unreal Engine Release (Build ${{ github.run_number }})
-          body: |
-            Single-mod release containing only the Unreal Engine project.
+          name: Unreal-Engine-Release
+          path: ${{ steps.package.outputs.zip_file }}
 
-            Installation:
-            - Extract the contents directly in the target game's executable folder (replace previous files).
-            - Overwrite existing dxgi.dll if you already have a ReShade/other mod that uses it so the Luma files take priority.
-            - Launch the game and press Home to bring up ReShade and the Luma menu.
-            - Test builds expose additional debugging tools; use the "-Test" archive if you need extra telemetry.
-
-            Last commit: ${{ github.event.head_commit.message }}
-          files: |
-            Luma-Unreal_Engine*.zip
+      - name: Upload Test artifact
+        if: matrix.artifact_suffix == 'Test'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Unreal-Engine-Test
+          path: ${{ steps.package.outputs.zip_file }}
