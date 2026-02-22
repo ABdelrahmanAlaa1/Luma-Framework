@@ -1,4 +1,4 @@
-name: Build Luma Unreal Engine Mod
+name: Build & Package Luma Unreal Engine Mod
 
 on:
   push:
@@ -7,58 +7,84 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-unreal-mod:
-    name: Build Unreal Engine mod artifacts
-    runs-on: ubuntu-latest
+  package-unreal:
+    name: Package Unreal Engine mod
+    runs-on: windows-latest
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
 
-      - name: Ensure zip is available
-        run: sudo apt-get update && sudo apt-get install -y zip
+      - name: Prepare temp package folder
+        shell: pwsh
+        run: |
+          Remove-Item -Recurse -Force temp_package -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path temp_package\Luma | Out-Null
 
-      - name: Create artifacts directory
-        run: mkdir -p artifacts
+      - name: Copy Shaders into temp
+        shell: pwsh
+        run: |
+          Copy-Item -Path 'Shaders/*' -Destination 'temp_package\Luma' -Recurse -Force
+
+      - name: Prune to Unreal Engine + allowed folders and file types
+        shell: pwsh
+        run: |
+          $shaderRoot = Join-Path 'temp_package' 'Luma'
+          $allowedDirs = @('Global','Includes','Unreal Engine')
+
+          Get-ChildItem -Path $shaderRoot -Directory | ForEach-Object {
+            if ($allowedDirs -notcontains $_.Name) {
+              Remove-Item $_.FullName -Recurse -Force
+            }
+          }
+
+          # Keep only .hlsl and .hlsli files under allowed folders
+          Get-ChildItem -Path $shaderRoot -Recurse -File | ForEach-Object {
+            if (@('.hlsl','.hlsli') -notcontains $_.Extension.ToLower()) {
+              Remove-Item $_.FullName -Force
+            }
+          }
 
       - name: Create full Luma-Unreal_Engine.zip
+        shell: pwsh
         run: |
-          set -e
-          if [ -d "Shaders/Unreal Engine" ]; then
-            zip -r artifacts/Luma-Unreal_Engine.zip "Shaders/Unreal Engine"
-            echo "Created artifacts/Luma-Unreal_Engine.zip"
-          else
-            echo "Directory 'Shaders/Unreal Engine' not found"; exit 1
-          fi
+          if (-not (Test-Path 'temp_package\Luma')) { Write-Error 'temp_package\Luma missing'; exit 1 }
+          if (Test-Path 'Luma-Unreal_Engine.zip') { Remove-Item 'Luma-Unreal_Engine.zip' -Force }
+          Compress-Archive -Path 'temp_package\Luma\*' -DestinationPath 'Luma-Unreal_Engine.zip' -Force
+          Write-Host 'Created Luma-Unreal_Engine.zip'
 
-      - name: Create Luma-Unreal_Engine-Test.zip (small-files test bundle)
+      - name: Create Luma-Unreal_Engine-Test.zip (small-files bundle)
+        shell: pwsh
         run: |
-          python3 - <<'PY'
-import os, zipfile
-root = 'Shaders/Unreal Engine'
-out = 'artifacts/Luma-Unreal_Engine-Test.zip'
-if not os.path.isdir(root):
-    raise SystemExit("Directory not found: %s" % root)
-with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as z:
-    for dirpath, dirs, files in os.walk(root):
-        for f in files:
-            fp = os.path.join(dirpath, f)
-            try:
-                size = os.path.getsize(fp)
-            except OSError:
-                continue
-            # Include only small files in the test bundle to keep it lightweight
-            if size <= 200_000:
-                arcname = os.path.relpath(fp, root)
-                z.write(fp, arcname)
-print('Created', out)
-PY
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $root = 'temp_package\Luma\Unreal Engine'
+          if (-not (Test-Path $root)) { Write-Error "Path not found: $root"; exit 1 }
+          $out = 'Luma-Unreal_Engine-Test.zip'
+          if (Test-Path $out) { Remove-Item $out -Force }
+          $zip = [System.IO.Compression.ZipFile]::Open($out, 'Create')
+          try {
+            Get-ChildItem -Path $root -Recurse -File | Where-Object { $_.Length -le 200KB } | ForEach-Object {
+              $entryName = $_.FullName.Substring($root.Length + 1) -replace '\\','/'
+              [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $_.FullName, $entryName)
+            }
+          } finally { $zip.Dispose() }
+          Write-Host "Created $out"
 
-      - name: List created artifacts
-        run: ls -lah artifacts || true
+      - name: List produced files
+        shell: pwsh
+        run: Get-ChildItem -Path . -Filter 'Luma-Unreal_Engine*.zip' -File | Format-Table Name,Length
 
-      - name: Upload mod artifacts
+      - name: Upload Unreal Engine mod artifacts
         uses: actions/upload-artifact@v4
         with:
           name: Luma-Unreal-Engine-artifacts
-          path: artifacts/*.zip
+          path: |
+            Luma-Unreal_Engine.zip
+            Luma-Unreal_Engine-Test.zip
+
+      - name: Cleanup temp
+        shell: pwsh
+        run: Remove-Item -Recurse -Force temp_package
