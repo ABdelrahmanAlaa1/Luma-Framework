@@ -18,79 +18,89 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
-      - name: Prepare temp package folder
+      - name: Prepare release and dev temp packages
         shell: pwsh
         run: |
-          Remove-Item -Recurse -Force temp_package -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory -Path temp_package\Luma | Out-Null
+          # Cleanup any previous temp packages
+          Remove-Item -Recurse -Force temp_package_release, temp_package_dev -ErrorAction SilentlyContinue
+          # Create directories
+          New-Item -ItemType Directory -Path temp_package_release\Luma -Force | Out-Null
+          New-Item -ItemType Directory -Path temp_package_dev\Luma -Force | Out-Null
 
-      - name: Copy Shaders into temp
-        shell: pwsh
-        run: |
-          Copy-Item -Path 'Shaders/*' -Destination 'temp_package\Luma' -Recurse -Force
+          # Copy Shaders to both packages
+          Copy-Item -Path 'Shaders/*' -Destination 'temp_package_release\Luma' -Recurse -Force
+          Copy-Item -Path 'Shaders/*' -Destination 'temp_package_dev\Luma' -Recurse -Force
 
-      - name: Prune to Unreal Engine + allowed folders and file types
-        shell: pwsh
-        run: |
-          $shaderRoot = Join-Path 'temp_package' 'Luma'
+          # Prune release package: keep only allowed top-level dirs and remove dev/sample folders
+          $shaderRootRel = Join-Path 'temp_package_release' 'Luma'
           $allowedDirs = @('Global','Includes','Unreal Engine')
-
-          Get-ChildItem -Path $shaderRoot -Directory | ForEach-Object {
+          Get-ChildItem -Path $shaderRootRel -Directory | ForEach-Object {
             if ($allowedDirs -notcontains $_.Name) {
               Remove-Item $_.FullName -Recurse -Force
+            } else {
+              $foldersToDelete = @('Unused','Dev','Sample')
+              foreach ($folder in $foldersToDelete) {
+                $target = Join-Path $_.FullName $folder
+                if (Test-Path $target) { Remove-Item $target -Recurse -Force }
+              }
             }
           }
 
-          # Keep only .hlsl and .hlsli files under allowed folders
-          Get-ChildItem -Path $shaderRoot -Recurse -File | ForEach-Object {
-            if (@('.hlsl','.hlsli') -notcontains $_.Extension.ToLower()) {
-              Remove-Item $_.FullName -Force
-            }
+          # For release: remove non-hlsl/hlsli files
+          Get-ChildItem -Path $shaderRootRel -Recurse -File | ForEach-Object {
+            if (@('.hlsl','.hlsli') -notcontains $_.Extension.ToLower()) { Remove-Item $_.FullName -Force }
           }
 
-      - name: Add d3dcompiler and binaries (dxgi, NGX, addon)
+      - name: Add d3dcompiler and binaries (dxgi, NGX, addon) to both packages
         shell: pwsh
         run: |
-          # Copy d3dcompiler into the Luma root
-          if (Test-Path 'Shaders/Decompiler/d3dcompiler_47.dll') {
-            Copy-Item -Path 'Shaders/Decompiler/d3dcompiler_47.dll' -Destination 'temp_package\Luma' -Force
-          } elseif (Test-Path 'Shaders/Decompiler/d3dcompiler_47_x32.dll') {
-            Copy-Item -Path 'Shaders/Decompiler/d3dcompiler_47_x32.dll' -Destination 'temp_package\Luma' -Force
+          $d3d_x64 = 'Shaders/Decompiler/d3dcompiler_47.dll'
+          $d3d_x32 = 'Shaders/Decompiler/d3dcompiler_47_x32.dll'
+          $rsSrc64 = 'Source/External/reshade/bin/x64/Release/ReShade64.dll'
+          $rsSrc32 = 'Source/External/reshade/bin/Win32/Release/ReShade32.dll'
+          $ngxRel = 'Source/External/NGX/bin/rel/nvngx_dlss.dll'
+          $ngxDev = 'Source/External/NGX/bin/dev/nvngx_dlss.dll'
+
+          # Copy d3dcompiler into both Luma roots (prefer x64)
+          if (Test-Path $d3d_x64) {
+            Copy-Item -Path $d3d_x64 -Destination 'temp_package_release\Luma' -Force
+            Copy-Item -Path $d3d_x64 -Destination 'temp_package_dev\Luma' -Force
+          } elseif (Test-Path $d3d_x32) {
+            Copy-Item -Path $d3d_x32 -Destination 'temp_package_release\Luma' -Force
+            Copy-Item -Path $d3d_x32 -Destination 'temp_package_dev\Luma' -Force
           } else {
             Write-Host 'd3dcompiler not found; continuing without it.'
           }
 
-          # Copy ReShade dxgi.dll into temp root if present
-          $rsSrc64 = 'Source/External/reshade/bin/x64/Release/ReShade64.dll'
-          $rsSrc32 = 'Source/External/reshade/bin/Win32/Release/ReShade32.dll'
+          # Copy ReShade as dxgi.dll into both temp roots if present
           if (Test-Path $rsSrc64) {
-            Copy-Item -Path $rsSrc64 -Destination 'temp_package\dxgi.dll' -Force
-            Write-Host 'Copied ReShade64 to temp_package\dxgi.dll'
+            Copy-Item -Path $rsSrc64 -Destination 'temp_package_release\dxgi.dll' -Force
+            Copy-Item -Path $rsSrc64 -Destination 'temp_package_dev\dxgi.dll' -Force
+            Write-Host 'Copied ReShade64 to temp_package/*\\dxgi.dll'
           } elseif (Test-Path $rsSrc32) {
-            Copy-Item -Path $rsSrc32 -Destination 'temp_package\dxgi.dll' -Force
-            Write-Host 'Copied ReShade32 to temp_package\dxgi.dll'
+            Copy-Item -Path $rsSrc32 -Destination 'temp_package_release\dxgi.dll' -Force
+            Copy-Item -Path $rsSrc32 -Destination 'temp_package_dev\dxgi.dll' -Force
+            Write-Host 'Copied ReShade32 to temp_package/*\\dxgi.dll'
           } else {
             Write-Host 'ReShade build not found; skipping dxgi copy.'
           }
 
-          # Copy NGX DLSS DLL if available (try release then dev)
-          $ngxRel = 'Source/External/NGX/bin/rel/nvngx_dlss.dll'
-          $ngxDev = 'Source/External/NGX/bin/dev/nvngx_dlss.dll'
+          # Copy NGX DLSS: use rel for release, dev for dev if available
           if (Test-Path $ngxRel) {
-            Copy-Item -Path $ngxRel -Destination 'temp_package\nvngx_dlss.dll' -Force
-            Write-Host 'Copied NGX release DLL'
-          } elseif (Test-Path $ngxDev) {
-            Copy-Item -Path $ngxDev -Destination 'temp_package\nvngx_dlss.dll' -Force
-            Write-Host 'Copied NGX dev DLL'
-          } else {
-            Write-Host 'NGX DLSS DLL not found; skipping'
+            Copy-Item -Path $ngxRel -Destination 'temp_package_release\nvngx_dlss.dll' -Force
+            Write-Host 'Copied NGX rel to release package'
+          }
+          if (Test-Path $ngxDev) {
+            Copy-Item -Path $ngxDev -Destination 'temp_package_dev\nvngx_dlss.dll' -Force
+            Write-Host 'Copied NGX dev to dev package'
           }
 
           # Try to locate an addon file for Luma-Unreal Engine in build outputs or repo
           $addon = Get-ChildItem -Path . -Recurse -Filter 'Luma-Unreal*.addon' -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($addon) {
-            Copy-Item -Path $addon.FullName -Destination 'temp_package\' -Force
-            Write-Host "Copied addon $($addon.Name) to temp_package"
+            Copy-Item -Path $addon.FullName -Destination 'temp_package_release\' -Force
+            Copy-Item -Path $addon.FullName -Destination 'temp_package_dev\' -Force
+            Write-Host "Copied addon $($addon.Name) to both temp_package_release and temp_package_dev"
           } else {
             Write-Host 'No Luma-Unreal addon found in repo; skipping addon copy.'
           }
@@ -98,28 +108,18 @@ jobs:
       - name: Create full Luma-Unreal_Engine.zip
         shell: pwsh
         run: |
-          if (-not (Test-Path 'temp_package')) { Write-Error 'temp_package missing'; exit 1 }
+          if (-not (Test-Path 'temp_package_release')) { Write-Error 'temp_package_release missing'; exit 1 }
           if (Test-Path 'Luma-Unreal_Engine.zip') { Remove-Item 'Luma-Unreal_Engine.zip' -Force }
-          # Package the whole temp_package contents: Luma folder plus dxgi/addon/nvngx if present
-          Compress-Archive -Path 'temp_package\*' -DestinationPath 'Luma-Unreal_Engine.zip' -Force
+          Compress-Archive -Path 'temp_package_release\*' -DestinationPath 'Luma-Unreal_Engine.zip' -Force
           Write-Host 'Created Luma-Unreal_Engine.zip'
 
-      - name: Create Luma-Unreal_Engine-Test.zip (small-files bundle)
+      - name: Create Luma-Unreal_Engine-Test.zip (development build bundle)
         shell: pwsh
         run: |
-          Add-Type -AssemblyName System.IO.Compression.FileSystem
-          $root = 'temp_package\Luma\Unreal Engine'
-          if (-not (Test-Path $root)) { Write-Error "Path not found: $root"; exit 1 }
-          $out = 'Luma-Unreal_Engine-Test.zip'
-          if (Test-Path $out) { Remove-Item $out -Force }
-          $zip = [System.IO.Compression.ZipFile]::Open($out, 'Create')
-          try {
-            Get-ChildItem -Path $root -Recurse -File | Where-Object { $_.Length -le 200KB } | ForEach-Object {
-              $entryName = $_.FullName.Substring($root.Length + 1) -replace '\\','/'
-              [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $_.FullName, $entryName)
-            }
-          } finally { $zip.Dispose() }
-          Write-Host "Created $out"
+          if (-not (Test-Path 'temp_package_dev')) { Write-Error 'temp_package_dev missing'; exit 1 }
+          if (Test-Path 'Luma-Unreal_Engine-Test.zip') { Remove-Item 'Luma-Unreal_Engine-Test.zip' -Force }
+          Compress-Archive -Path 'temp_package_dev\*' -DestinationPath 'Luma-Unreal_Engine-Test.zip' -Force
+          Write-Host 'Created Luma-Unreal_Engine-Test.zip (development build)'
 
       - name: List produced files
         shell: pwsh
