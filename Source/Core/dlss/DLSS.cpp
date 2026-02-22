@@ -11,9 +11,335 @@
 #include <unordered_set>
 #include <wrl/client.h>
 #include <d3d11.h>
+#include <filesystem>
+#include <winreg.h>
 
 // Should be <= the max (last) of NVSDK_NGX_PerfQuality_Value
 #define NUM_PERF_QUALITY_MODES 6
+
+// OptiScaler compatibility: when OptiScaler is present (acting as dxgi.dll etc.),
+// it intercepts LoadLibrary("_nvngx.dll") and returns its own module instead of
+// the real NVIDIA nvngx runtime. This breaks Luma's DLSS/DLAA because OptiScaler's
+// NGX dispatch layer isn't fully transparent. To work around this, we detect
+// OptiScaler and load the real _nvngx.dll directly from the NVIDIA driver directory,
+// then resolve NGX function pointers via GetProcAddress.
+
+namespace OptiScalerCompat
+{
+	// Function pointer types matching the real _nvngx.dll exports
+	typedef NVSDK_NGX_Result(__cdecl* PFN_D3D11_Init_ProjectID)(const char*, NVSDK_NGX_EngineType, const char*, const wchar_t*, ID3D11Device*, NVSDK_NGX_Version, const NVSDK_NGX_FeatureCommonInfo*);
+	typedef NVSDK_NGX_Result(__cdecl* PFN_D3D11_Init_Ext)(unsigned long long, const wchar_t*, ID3D11Device*, NVSDK_NGX_Version, const NVSDK_NGX_FeatureCommonInfo*);
+	typedef NVSDK_NGX_Result(__cdecl* PFN_D3D11_Shutdown)(void);
+	typedef NVSDK_NGX_Result(__cdecl* PFN_D3D11_Shutdown1)(ID3D11Device*);
+	typedef NVSDK_NGX_Result(__cdecl* PFN_D3D11_GetCapabilityParameters)(NVSDK_NGX_Parameter**);
+	typedef NVSDK_NGX_Result(__cdecl* PFN_D3D11_AllocateParameters)(NVSDK_NGX_Parameter**);
+	typedef NVSDK_NGX_Result(__cdecl* PFN_D3D11_DestroyParameters)(NVSDK_NGX_Parameter*);
+	typedef NVSDK_NGX_Result(__cdecl* PFN_D3D11_CreateFeature)(ID3D11DeviceContext*, NVSDK_NGX_Feature, NVSDK_NGX_Parameter*, NVSDK_NGX_Handle**);
+	typedef NVSDK_NGX_Result(__cdecl* PFN_D3D11_ReleaseFeature)(NVSDK_NGX_Handle*);
+	typedef NVSDK_NGX_Result(__cdecl* PFN_D3D11_EvaluateFeature)(ID3D11DeviceContext*, const NVSDK_NGX_Handle*, NVSDK_NGX_Parameter*, PFN_NVSDK_NGX_ProgressCallback);
+
+	static bool s_detected = false;
+	static bool s_detection_done = false;
+	static HMODULE s_real_nvngx = nullptr;
+	static bool s_inited = false;
+
+	// Function pointers to the real _nvngx.dll
+	static PFN_D3D11_Init_ProjectID s_Init_ProjectID = nullptr;
+	static PFN_D3D11_Init_Ext s_Init_Ext = nullptr;
+	static PFN_D3D11_Shutdown s_Shutdown = nullptr;
+	static PFN_D3D11_Shutdown1 s_Shutdown1 = nullptr;
+	static PFN_D3D11_GetCapabilityParameters s_GetCapabilityParameters = nullptr;
+	static PFN_D3D11_AllocateParameters s_AllocateParameters = nullptr;
+	static PFN_D3D11_DestroyParameters s_DestroyParameters = nullptr;
+	static PFN_D3D11_CreateFeature s_CreateFeature = nullptr;
+	static PFN_D3D11_ReleaseFeature s_ReleaseFeature = nullptr;
+	static PFN_D3D11_EvaluateFeature s_EvaluateFeature = nullptr;
+
+	static std::filesystem::path FindNvngxSource()
+	{
+		// Check registry for NGX core path (same approach as OptiScaler and NVIDIA's own code)
+		// Registry key: HKLM\SOFTWARE\NVIDIA Corporation\Global\NGXCore\FullPath
+		// Value is typically the full path to _nvngx.dll itself
+		HKEY key = nullptr;
+		if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\NVIDIA Corporation\\Global\\NGXCore", 0, KEY_READ, &key) == ERROR_SUCCESS)
+		{
+			wchar_t path[MAX_PATH] = {};
+			DWORD size = sizeof(path);
+			DWORD type = REG_SZ;
+			if (RegQueryValueExW(key, L"FullPath", nullptr, &type, reinterpret_cast<LPBYTE>(path), &size) == ERROR_SUCCESS)
+			{
+				RegCloseKey(key);
+				std::filesystem::path reg_path(path);
+				// FullPath may be the file itself or a directory
+				if (std::filesystem::exists(reg_path) && !std::filesystem::is_directory(reg_path))
+					return reg_path;
+				// If it's a directory, look for the DLL inside
+				auto p = reg_path / L"_nvngx.dll";
+				if (std::filesystem::exists(p)) return p;
+				p = reg_path / L"nvngx.dll";
+				if (std::filesystem::exists(p)) return p;
+			}
+			else
+			{
+				RegCloseKey(key);
+			}
+		}
+
+		// Fallback: System32
+		wchar_t sys_dir[MAX_PATH] = {};
+		GetSystemDirectoryW(sys_dir, MAX_PATH);
+		auto p = std::filesystem::path(sys_dir) / L"_nvngx.dll";
+		if (std::filesystem::exists(p)) return p;
+		p = std::filesystem::path(sys_dir) / L"nvngx.dll";
+		if (std::filesystem::exists(p)) return p;
+
+		return {};
+	}
+
+	static bool DetectOptiScaler()
+	{
+		if (s_detection_done) return s_detected;
+		s_detection_done = true;
+
+		// Get the exe directory
+		wchar_t exe_path[MAX_PATH] = {};
+		GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
+		std::filesystem::path exe_dir = std::filesystem::path(exe_path).parent_path();
+
+		// Check for OptiScaler.ini - required to confirm OptiScaler presence (avoids false positives from other DLL proxies)
+		bool has_ini = std::filesystem::exists(exe_dir / L"OptiScaler.ini");
+		if (!has_ini)
+		{
+			s_detected = false;
+			return false;
+		}
+
+		// Also verify one of OptiScaler's known proxy DLL names is loaded and exports NGX functions
+		// OptiScaler typically runs as dxgi.dll, wininet.dll, winmm.dll, version.dll, winhttp.dll, or dbghelp.dll
+		static const wchar_t* known_proxy_names[] = {
+			L"dxgi.dll", L"wininet.dll", L"winmm.dll", L"version.dll", L"winhttp.dll", L"dbghelp.dll"
+		};
+
+		for (const auto* proxy_name : known_proxy_names)
+		{
+			HMODULE mod = GetModuleHandleW(proxy_name);
+			if (mod != nullptr)
+			{
+				// OptiScaler exports NVSDK_NGX functions from whichever proxy DLL it acts as
+				if (GetProcAddress(mod, "NVSDK_NGX_D3D11_Init_Ext") != nullptr)
+				{
+					s_detected = true;
+					return true;
+				}
+			}
+		}
+
+		// If OptiScaler.ini exists but no proxy DLL found with NGX exports,
+		// still treat as detected (OptiScaler may be loading as nvngx.dll itself)
+		s_detected = true;
+		return true;
+	}
+
+	static bool LoadRealNvngx()
+	{
+		if (s_real_nvngx != nullptr) return true;
+
+		auto source_path = FindNvngxSource();
+		if (source_path.empty()) return false;
+
+		// OptiScaler hooks LoadLibrary/LdrLoadDll and intercepts ANY load where the
+		// filename ends with "_nvngx.dll" or "nvngx.dll" (case-insensitive "ends with" match).
+		// Even full absolute paths are caught. To bypass this, we copy the real DLL to a
+		// temp location with a name that doesn't match OptiScaler's patterns.
+		auto temp_path = std::filesystem::temp_directory_path() / L"luma_ngx_core.dll";
+
+		bool loaded_via_copy = false;
+		try
+		{
+			std::filesystem::copy_file(source_path, temp_path, std::filesystem::copy_options::overwrite_existing);
+			s_real_nvngx = LoadLibraryExW(temp_path.c_str(), NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+			loaded_via_copy = (s_real_nvngx != nullptr);
+		}
+		catch (const std::filesystem::filesystem_error&) {}
+
+		// Fallback: try loading directly (works when OptiScaler hooks aren't active)
+		if (!s_real_nvngx)
+		{
+			s_real_nvngx = LoadLibraryExW(source_path.c_str(), NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+		}
+
+		if (!s_real_nvngx) return false;
+
+		// Resolve function pointers from the REAL _nvngx.dll
+		s_Init_ProjectID = (PFN_D3D11_Init_ProjectID)GetProcAddress(s_real_nvngx, "NVSDK_NGX_D3D11_Init_ProjectID");
+		s_Init_Ext = (PFN_D3D11_Init_Ext)GetProcAddress(s_real_nvngx, "NVSDK_NGX_D3D11_Init_Ext");
+		s_Shutdown = (PFN_D3D11_Shutdown)GetProcAddress(s_real_nvngx, "NVSDK_NGX_D3D11_Shutdown");
+		s_Shutdown1 = (PFN_D3D11_Shutdown1)GetProcAddress(s_real_nvngx, "NVSDK_NGX_D3D11_Shutdown1");
+		s_GetCapabilityParameters = (PFN_D3D11_GetCapabilityParameters)GetProcAddress(s_real_nvngx, "NVSDK_NGX_D3D11_GetCapabilityParameters");
+		s_AllocateParameters = (PFN_D3D11_AllocateParameters)GetProcAddress(s_real_nvngx, "NVSDK_NGX_D3D11_AllocateParameters");
+		s_DestroyParameters = (PFN_D3D11_DestroyParameters)GetProcAddress(s_real_nvngx, "NVSDK_NGX_D3D11_DestroyParameters");
+		s_CreateFeature = (PFN_D3D11_CreateFeature)GetProcAddress(s_real_nvngx, "NVSDK_NGX_D3D11_CreateFeature");
+		s_ReleaseFeature = (PFN_D3D11_ReleaseFeature)GetProcAddress(s_real_nvngx, "NVSDK_NGX_D3D11_ReleaseFeature");
+		s_EvaluateFeature = (PFN_D3D11_EvaluateFeature)GetProcAddress(s_real_nvngx, "NVSDK_NGX_D3D11_EvaluateFeature");
+
+		bool ok = (s_Init_ProjectID || s_Init_Ext) && s_GetCapabilityParameters && s_CreateFeature && s_EvaluateFeature;
+		if (!ok)
+		{
+			FreeLibrary(s_real_nvngx);
+			s_real_nvngx = nullptr;
+		}
+		return ok;
+	}
+
+	static bool IsActive() { return DetectOptiScaler() && LoadRealNvngx(); }
+
+	// Wrapper functions: when OptiScaler is active, use direct function pointers to the real nvngx.
+	// Otherwise fall through to the standard dispatch library (nvsdk_ngx_d.lib).
+	static NVSDK_NGX_Result Wrap_Init(const char* project_id, NVSDK_NGX_EngineType engine_type,
+	                                   const char* engine_version, const wchar_t* data_path,
+	                                   ID3D11Device* device)
+	{
+		if (IsActive() && s_Init_ProjectID)
+			return s_Init_ProjectID(project_id, engine_type, engine_version, data_path, device, NVSDK_NGX_Version_API, nullptr);
+		return NVSDK_NGX_D3D11_Init_with_ProjectID(project_id, engine_type, engine_version, data_path, device);
+	}
+
+	static NVSDK_NGX_Result Wrap_Shutdown1(ID3D11Device* device)
+	{
+		if (IsActive())
+		{
+			if (s_Shutdown1) return s_Shutdown1(device);
+			if (s_Shutdown) return s_Shutdown();
+			return NVSDK_NGX_Result_FAIL_FeatureNotSupported;
+		}
+		return NVSDK_NGX_D3D11_Shutdown1(device);
+	}
+
+	static NVSDK_NGX_Result Wrap_GetCapabilityParameters(NVSDK_NGX_Parameter** params)
+	{
+		if (IsActive() && s_GetCapabilityParameters)
+			return s_GetCapabilityParameters(params);
+		return NVSDK_NGX_D3D11_GetCapabilityParameters(params);
+	}
+
+	static NVSDK_NGX_Result Wrap_AllocateParameters(NVSDK_NGX_Parameter** params)
+	{
+		if (IsActive() && s_AllocateParameters)
+			return s_AllocateParameters(params);
+		return NVSDK_NGX_D3D11_AllocateParameters(params);
+	}
+
+	static NVSDK_NGX_Result Wrap_DestroyParameters(NVSDK_NGX_Parameter* params)
+	{
+		if (IsActive() && s_DestroyParameters)
+			return s_DestroyParameters(params);
+		return NVSDK_NGX_D3D11_DestroyParameters(params);
+	}
+
+	static NVSDK_NGX_Result Wrap_CreateFeature(ID3D11DeviceContext* ctx, NVSDK_NGX_Feature feat,
+	                                            NVSDK_NGX_Parameter* params, NVSDK_NGX_Handle** handle)
+	{
+		if (IsActive() && s_CreateFeature)
+			return s_CreateFeature(ctx, feat, params, handle);
+		return NVSDK_NGX_D3D11_CreateFeature(ctx, feat, params, handle);
+	}
+
+	static NVSDK_NGX_Result Wrap_ReleaseFeature(NVSDK_NGX_Handle* handle)
+	{
+		if (IsActive() && s_ReleaseFeature)
+			return s_ReleaseFeature(handle);
+		return NVSDK_NGX_D3D11_ReleaseFeature(handle);
+	}
+
+	static NVSDK_NGX_Result Wrap_EvaluateFeature(ID3D11DeviceContext* ctx, const NVSDK_NGX_Handle* handle,
+	                                              NVSDK_NGX_Parameter* params)
+	{
+		if (IsActive() && s_EvaluateFeature)
+			return s_EvaluateFeature(ctx, handle, params, nullptr);
+		return NVSDK_NGX_D3D11_EvaluateFeature_C(ctx, handle, params, nullptr);
+	}
+
+	// OptiScaler-aware version of NGX_D3D11_CREATE_DLSS_EXT.
+	// Sets DLSS create parameters, then calls CreateFeature (bypassing dispatch lib when OptiScaler is active).
+	static NVSDK_NGX_Result Wrap_CREATE_DLSS(ID3D11DeviceContext* ctx, NVSDK_NGX_Handle** handle,
+	                                          NVSDK_NGX_Parameter* params, NVSDK_NGX_DLSS_Create_Params* create_params)
+	{
+		// Same parameter setup as NGX_D3D11_CREATE_DLSS_EXT
+		NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_Width, create_params->Feature.InWidth);
+		NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_Height, create_params->Feature.InHeight);
+		NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_OutWidth, create_params->Feature.InTargetWidth);
+		NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_OutHeight, create_params->Feature.InTargetHeight);
+		NVSDK_NGX_Parameter_SetI(params, NVSDK_NGX_Parameter_PerfQualityValue, create_params->Feature.InPerfQualityValue);
+		NVSDK_NGX_Parameter_SetI(params, NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, create_params->InFeatureCreateFlags);
+		NVSDK_NGX_Parameter_SetI(params, NVSDK_NGX_Parameter_DLSS_Enable_Output_Subrects, create_params->InEnableOutputSubrects ? 1 : 0);
+		return Wrap_CreateFeature(ctx, NVSDK_NGX_Feature_SuperSampling, params, handle);
+	}
+
+	// OptiScaler-aware version of NGX_D3D11_EVALUATE_DLSS_EXT.
+	// Sets DLSS eval parameters, then calls EvaluateFeature (bypassing dispatch lib when OptiScaler is active).
+	static NVSDK_NGX_Result Wrap_EVALUATE_DLSS(ID3D11DeviceContext* ctx, NVSDK_NGX_Handle* handle,
+	                                            NVSDK_NGX_Parameter* params, NVSDK_NGX_D3D11_DLSS_Eval_Params* eval)
+	{
+		// Same parameter setup as NGX_D3D11_EVALUATE_DLSS_EXT
+		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_Color, eval->Feature.pInColor);
+		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_Output, eval->Feature.pInOutput);
+		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_Depth, eval->pInDepth);
+		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_MotionVectors, eval->pInMotionVectors);
+		NVSDK_NGX_Parameter_SetF(params, NVSDK_NGX_Parameter_Jitter_Offset_X, eval->InJitterOffsetX);
+		NVSDK_NGX_Parameter_SetF(params, NVSDK_NGX_Parameter_Jitter_Offset_Y, eval->InJitterOffsetY);
+		NVSDK_NGX_Parameter_SetF(params, NVSDK_NGX_Parameter_Sharpness, eval->Feature.InSharpness);
+		NVSDK_NGX_Parameter_SetI(params, NVSDK_NGX_Parameter_Reset, eval->InReset);
+		NVSDK_NGX_Parameter_SetF(params, NVSDK_NGX_Parameter_MV_Scale_X, eval->InMVScaleX == 0.0f ? 1.0f : eval->InMVScaleX);
+		NVSDK_NGX_Parameter_SetF(params, NVSDK_NGX_Parameter_MV_Scale_Y, eval->InMVScaleY == 0.0f ? 1.0f : eval->InMVScaleY);
+		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_TransparencyMask, eval->pInTransparencyMask);
+		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_ExposureTexture, eval->pInExposureTexture);
+		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_Mask, eval->pInBiasCurrentColorMask);
+		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_GBuffer_Albedo, eval->GBufferSurface.pInAttrib[NVSDK_NGX_GBUFFER_ALBEDO]);
+		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_GBuffer_Roughness, eval->GBufferSurface.pInAttrib[NVSDK_NGX_GBUFFER_ROUGHNESS]);
+		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_GBuffer_Metallic, eval->GBufferSurface.pInAttrib[NVSDK_NGX_GBUFFER_METALLIC]);
+		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_GBuffer_Specular, eval->GBufferSurface.pInAttrib[NVSDK_NGX_GBUFFER_SPECULAR]);
+		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_GBuffer_Subsurface, eval->GBufferSurface.pInAttrib[NVSDK_NGX_GBUFFER_SUBSURFACE]);
+		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_GBuffer_Normals, eval->GBufferSurface.pInAttrib[NVSDK_NGX_GBUFFER_NORMALS]);
+		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_GBuffer_ShadingModelId, eval->GBufferSurface.pInAttrib[NVSDK_NGX_GBUFFER_SHADINGMODELID]);
+		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_GBuffer_MaterialId, eval->GBufferSurface.pInAttrib[NVSDK_NGX_GBUFFER_MATERIALID]);
+		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_GBuffer_Atrrib_8, eval->GBufferSurface.pInAttrib[8]);
+		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_GBuffer_Atrrib_9, eval->GBufferSurface.pInAttrib[9]);
+		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_GBuffer_Atrrib_10, eval->GBufferSurface.pInAttrib[10]);
+		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_GBuffer_Atrrib_11, eval->GBufferSurface.pInAttrib[11]);
+		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_GBuffer_Atrrib_12, eval->GBufferSurface.pInAttrib[12]);
+		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_GBuffer_Atrrib_13, eval->GBufferSurface.pInAttrib[13]);
+		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_GBuffer_Atrrib_14, eval->GBufferSurface.pInAttrib[14]);
+		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_GBuffer_Atrrib_15, eval->GBufferSurface.pInAttrib[15]);
+		NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_TonemapperType, eval->InToneMapperType);
+		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_MotionVectors3D, eval->pInMotionVectors3D);
+		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_IsParticleMask, eval->pInIsParticleMask);
+		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_AnimatedTextureMask, eval->pInAnimatedTextureMask);
+		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_DepthHighRes, eval->pInDepthHighRes);
+		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_Position_ViewSpace, eval->pInPositionViewSpace);
+		NVSDK_NGX_Parameter_SetF(params, NVSDK_NGX_Parameter_FrameTimeDeltaInMsec, eval->InFrameTimeDeltaInMsec);
+		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_RayTracingHitDistance, eval->pInRayTracingHitDistance);
+		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_MotionVectorsReflection, eval->pInMotionVectorsReflections);
+		NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_DLSS_Input_Color_Subrect_Base_X, eval->InColorSubrectBase.X);
+		NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_DLSS_Input_Color_Subrect_Base_Y, eval->InColorSubrectBase.Y);
+		NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_DLSS_Input_Depth_Subrect_Base_X, eval->InDepthSubrectBase.X);
+		NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_DLSS_Input_Depth_Subrect_Base_Y, eval->InDepthSubrectBase.Y);
+		NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_DLSS_Input_MV_SubrectBase_X, eval->InMVSubrectBase.X);
+		NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_DLSS_Input_MV_SubrectBase_Y, eval->InMVSubrectBase.Y);
+		NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_DLSS_Input_Translucency_SubrectBase_X, eval->InTranslucencySubrectBase.X);
+		NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_DLSS_Input_Translucency_SubrectBase_Y, eval->InTranslucencySubrectBase.Y);
+		NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_SubrectBase_X, eval->InBiasCurrentColorSubrectBase.X);
+		NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_SubrectBase_Y, eval->InBiasCurrentColorSubrectBase.Y);
+		NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_DLSS_Output_Subrect_Base_X, eval->InOutputSubrectBase.X);
+		NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_DLSS_Output_Subrect_Base_Y, eval->InOutputSubrectBase.Y);
+		NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, eval->InRenderSubrectDimensions.Width);
+		NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, eval->InRenderSubrectDimensions.Height);
+		NVSDK_NGX_Parameter_SetF(params, NVSDK_NGX_Parameter_DLSS_Pre_Exposure, eval->InPreExposure == 0.0f ? 1.0f : eval->InPreExposure);
+		NVSDK_NGX_Parameter_SetF(params, NVSDK_NGX_Parameter_DLSS_Exposure_Scale, eval->InExposureScale == 0.0f ? 1.0f : eval->InExposureScale);
+		NVSDK_NGX_Parameter_SetI(params, NVSDK_NGX_Parameter_DLSS_Indicator_Invert_X_Axis, eval->InIndicatorInvertXAxis);
+		NVSDK_NGX_Parameter_SetI(params, NVSDK_NGX_Parameter_DLSS_Indicator_Invert_Y_Axis, eval->InIndicatorInvertYAxis);
+		return Wrap_EvaluateFeature(ctx, handle, params);
+	}
+}
 
 namespace NGX
 {
@@ -53,20 +379,20 @@ namespace NGX
 			{
 				if (handle != nullptr)
 				{
-					assert(NVSDK_NGX_SUCCEED(NVSDK_NGX_D3D11_ReleaseFeature(handle)));
+					assert(NVSDK_NGX_SUCCEED(OptiScalerCompat::Wrap_ReleaseFeature(handle)));
 				}
 			}
 			for (NVSDK_NGX_Parameter* parameter : unique_parameters)
 			{
 				if (parameter != nullptr)
 				{
-					assert(NVSDK_NGX_SUCCEED(NVSDK_NGX_D3D11_DestroyParameters(parameter)));
+					assert(NVSDK_NGX_SUCCEED(OptiScalerCompat::Wrap_DestroyParameters(parameter)));
 				}
 			}
 
 			if (capabilities_params != nullptr)
 			{
-				assert(NVSDK_NGX_SUCCEED(NVSDK_NGX_D3D11_DestroyParameters(capabilities_params)));
+				assert(NVSDK_NGX_SUCCEED(OptiScalerCompat::Wrap_DestroyParameters(capabilities_params)));
 			}
 		}
 
@@ -75,7 +401,7 @@ namespace NGX
 		{
 			NVSDK_NGX_Parameter* runtime_params = nullptr;
 			// Note: this could fail on outdated drivers
-			NVSDK_NGX_Result param_result = NVSDK_NGX_D3D11_AllocateParameters(&runtime_params);
+			NVSDK_NGX_Result param_result = OptiScalerCompat::Wrap_AllocateParameters(&runtime_params);
 			assert(NVSDK_NGX_SUCCEED(param_result));
 			if (NVSDK_NGX_FAILED(param_result))
 			{
@@ -130,7 +456,7 @@ namespace NGX
 			create_params.Feature.InPerfQualityValue = perf_quality_value;
 			create_params.InFeatureCreateFlags = create_flags;
 
-			NVSDK_NGX_Result create_result = NGX_D3D11_CREATE_DLSS_EXT(
+			NVSDK_NGX_Result create_result = OptiScalerCompat::Wrap_CREATE_DLSS(
 				command_list,
 				&feature,
 				runtime_params,
@@ -144,7 +470,7 @@ namespace NGX
 
 				create_params.Feature.InPerfQualityValue = NVSDK_NGX_PerfQuality_Value_Balanced;
 
-				create_result = NGX_D3D11_CREATE_DLSS_EXT(
+				create_result = OptiScalerCompat::Wrap_CREATE_DLSS(
 					command_list,
 					&feature,
 					runtime_params,
@@ -173,7 +499,7 @@ bool NGX::DLSS::Init(SR::InstanceData*& data, ID3D11Device* device, IDXGIAdapter
 	if (!custom_data && device)
 	{
 		const wchar_t* data_path = L"."; // The DLSS DLL should be distributed with Luma and be in the same folder as the mod
-		NVSDK_NGX_Result result = NVSDK_NGX_D3D11_Init_with_ProjectID(project_id, NVSDK_NGX_ENGINE_TYPE_CUSTOM, engine_version, data_path, device);
+		NVSDK_NGX_Result result = OptiScalerCompat::Wrap_Init(project_id, NVSDK_NGX_ENGINE_TYPE_CUSTOM, engine_version, data_path, device);
 
 		if (NVSDK_NGX_SUCCEED(result))
 		{
@@ -182,7 +508,7 @@ bool NGX::DLSS::Init(SR::InstanceData*& data, ID3D11Device* device, IDXGIAdapter
 
 			custom_data->min_resolution = 32; // DLSS doesn't support output below 32x32
 
-			result = NVSDK_NGX_D3D11_GetCapabilityParameters(&custom_data->capabilities_params);
+			result = OptiScalerCompat::Wrap_GetCapabilityParameters(&custom_data->capabilities_params);
 			assert(NVSDK_NGX_SUCCEED(result));
 		}
 
@@ -238,7 +564,7 @@ void NGX::DLSS::Deinit(SR::InstanceData*& data, ID3D11Device* optional_device)
 		delete custom_data;
 		custom_data = nullptr;
 
-		assert(NVSDK_NGX_SUCCEED(NVSDK_NGX_D3D11_Shutdown1(optional_device)));
+		assert(NVSDK_NGX_SUCCEED(OptiScalerCompat::Wrap_Shutdown1(optional_device)));
 	}
 }
 
@@ -350,12 +676,12 @@ bool NGX::DLSS::UpdateSettings(SR::InstanceData* data, ID3D11DeviceContext* comm
 	// Release old DLSS instance before creating a new one to prevent memory leaks
 	if (custom_data->instance.super_sampling_feature != nullptr)
 	{
-		NVSDK_NGX_D3D11_ReleaseFeature(custom_data->instance.super_sampling_feature);
+		OptiScalerCompat::Wrap_ReleaseFeature(custom_data->instance.super_sampling_feature);
 		custom_data->unique_handles.erase(custom_data->instance.super_sampling_feature);
 	}
 	if (custom_data->instance.runtime_params != nullptr)
 	{
-		NVSDK_NGX_D3D11_DestroyParameters(custom_data->instance.runtime_params);
+		OptiScalerCompat::Wrap_DestroyParameters(custom_data->instance.runtime_params);
 		custom_data->unique_parameters.erase(custom_data->instance.runtime_params);
 	}
 
@@ -410,7 +736,7 @@ bool NGX::DLSS::Draw(const SR::InstanceData* data, ID3D11DeviceContext* command_
 	eval_params.InJitterOffsetX = draw_data.jitter_x;
 	eval_params.InJitterOffsetY = draw_data.jitter_y;
 
-	NVSDK_NGX_Result result = NGX_D3D11_EVALUATE_DLSS_EXT(
+	NVSDK_NGX_Result result = OptiScalerCompat::Wrap_EVALUATE_DLSS(
 		command_list,
 		custom_data->instance.super_sampling_feature,
 		custom_data->instance.runtime_params,
