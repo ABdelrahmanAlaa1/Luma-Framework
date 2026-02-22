@@ -168,80 +168,124 @@ namespace OptiScalerCompat
 	}
 
 	// Reproduces NGX_D3D11_CREATE_DLSS_EXT parameter setup, then calls Wrap_CreateFeature.
+	// Uses direct vtable calls (params->Set) instead of dispatch lib functions (NVSDK_NGX_Parameter_Set*)
+	// because the dispatch lib may not be initialized when we bypass it for OptiScaler.
 	static NVSDK_NGX_Result Wrap_CREATE_DLSS(ID3D11DeviceContext* ctx, NVSDK_NGX_Handle** handle,
 	                                          NVSDK_NGX_Parameter* params, NVSDK_NGX_DLSS_Create_Params* cp)
 	{
-		NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_Width, cp->Feature.InWidth);
-		NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_Height, cp->Feature.InHeight);
-		NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_OutWidth, cp->Feature.InTargetWidth);
-		NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_OutHeight, cp->Feature.InTargetHeight);
-		NVSDK_NGX_Parameter_SetI(params, NVSDK_NGX_Parameter_PerfQualityValue, cp->Feature.InPerfQualityValue);
-		NVSDK_NGX_Parameter_SetI(params, NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, cp->InFeatureCreateFlags);
-		NVSDK_NGX_Parameter_SetI(params, NVSDK_NGX_Parameter_DLSS_Enable_Output_Subrects, cp->InEnableOutputSubrects ? 1 : 0);
+		params->Set(NVSDK_NGX_Parameter_Width, cp->Feature.InWidth);
+		params->Set(NVSDK_NGX_Parameter_Height, cp->Feature.InHeight);
+		params->Set(NVSDK_NGX_Parameter_OutWidth, cp->Feature.InTargetWidth);
+		params->Set(NVSDK_NGX_Parameter_OutHeight, cp->Feature.InTargetHeight);
+		params->Set(NVSDK_NGX_Parameter_PerfQualityValue, (int)cp->Feature.InPerfQualityValue);
+		params->Set(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, cp->InFeatureCreateFlags);
+		params->Set(NVSDK_NGX_Parameter_DLSS_Enable_Output_Subrects, (int)(cp->InEnableOutputSubrects ? 1 : 0));
 		return Wrap_CreateFeature(ctx, NVSDK_NGX_Feature_SuperSampling, params, handle);
 	}
 
 	// Reproduces NGX_D3D11_EVALUATE_DLSS_EXT parameter setup, then calls Wrap_EvaluateFeature.
+	// Uses direct vtable calls (params->Set) instead of dispatch lib functions.
 	static NVSDK_NGX_Result Wrap_EVALUATE_DLSS(ID3D11DeviceContext* ctx, NVSDK_NGX_Handle* handle,
 	                                            NVSDK_NGX_Parameter* params, NVSDK_NGX_D3D11_DLSS_Eval_Params* ep)
 	{
-		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_Color, ep->Feature.pInColor);
-		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_Output, ep->Feature.pInOutput);
-		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_Depth, ep->pInDepth);
-		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_MotionVectors, ep->pInMotionVectors);
-		NVSDK_NGX_Parameter_SetF(params, NVSDK_NGX_Parameter_Jitter_Offset_X, ep->InJitterOffsetX);
-		NVSDK_NGX_Parameter_SetF(params, NVSDK_NGX_Parameter_Jitter_Offset_Y, ep->InJitterOffsetY);
-		NVSDK_NGX_Parameter_SetF(params, NVSDK_NGX_Parameter_Sharpness, ep->Feature.InSharpness);
-		NVSDK_NGX_Parameter_SetI(params, NVSDK_NGX_Parameter_Reset, ep->InReset);
-		NVSDK_NGX_Parameter_SetF(params, NVSDK_NGX_Parameter_MV_Scale_X, ep->InMVScaleX == 0.0f ? 1.0f : ep->InMVScaleX);
-		NVSDK_NGX_Parameter_SetF(params, NVSDK_NGX_Parameter_MV_Scale_Y, ep->InMVScaleY == 0.0f ? 1.0f : ep->InMVScaleY);
-		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_TransparencyMask, ep->pInTransparencyMask);
-		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_ExposureTexture, ep->pInExposureTexture);
-		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_Mask, ep->pInBiasCurrentColorMask);
-		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_GBuffer_Albedo, ep->GBufferSurface.pInAttrib[NVSDK_NGX_GBUFFER_ALBEDO]);
-		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_GBuffer_Roughness, ep->GBufferSurface.pInAttrib[NVSDK_NGX_GBUFFER_ROUGHNESS]);
-		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_GBuffer_Metallic, ep->GBufferSurface.pInAttrib[NVSDK_NGX_GBUFFER_METALLIC]);
-		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_GBuffer_Specular, ep->GBufferSurface.pInAttrib[NVSDK_NGX_GBUFFER_SPECULAR]);
-		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_GBuffer_Subsurface, ep->GBufferSurface.pInAttrib[NVSDK_NGX_GBUFFER_SUBSURFACE]);
-		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_GBuffer_Normals, ep->GBufferSurface.pInAttrib[NVSDK_NGX_GBUFFER_NORMALS]);
-		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_GBuffer_ShadingModelId, ep->GBufferSurface.pInAttrib[NVSDK_NGX_GBUFFER_SHADINGMODELID]);
-		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_GBuffer_MaterialId, ep->GBufferSurface.pInAttrib[NVSDK_NGX_GBUFFER_MATERIALID]);
-		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_GBuffer_Atrrib_8, ep->GBufferSurface.pInAttrib[8]);
-		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_GBuffer_Atrrib_9, ep->GBufferSurface.pInAttrib[9]);
-		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_GBuffer_Atrrib_10, ep->GBufferSurface.pInAttrib[10]);
-		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_GBuffer_Atrrib_11, ep->GBufferSurface.pInAttrib[11]);
-		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_GBuffer_Atrrib_12, ep->GBufferSurface.pInAttrib[12]);
-		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_GBuffer_Atrrib_13, ep->GBufferSurface.pInAttrib[13]);
-		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_GBuffer_Atrrib_14, ep->GBufferSurface.pInAttrib[14]);
-		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_GBuffer_Atrrib_15, ep->GBufferSurface.pInAttrib[15]);
-		NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_TonemapperType, ep->InToneMapperType);
-		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_MotionVectors3D, ep->pInMotionVectors3D);
-		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_IsParticleMask, ep->pInIsParticleMask);
-		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_AnimatedTextureMask, ep->pInAnimatedTextureMask);
-		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_DepthHighRes, ep->pInDepthHighRes);
-		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_Position_ViewSpace, ep->pInPositionViewSpace);
-		NVSDK_NGX_Parameter_SetF(params, NVSDK_NGX_Parameter_FrameTimeDeltaInMsec, ep->InFrameTimeDeltaInMsec);
-		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_RayTracingHitDistance, ep->pInRayTracingHitDistance);
-		NVSDK_NGX_Parameter_SetD3d11Resource(params, NVSDK_NGX_Parameter_MotionVectorsReflection, ep->pInMotionVectorsReflections);
-		NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_DLSS_Input_Color_Subrect_Base_X, ep->InColorSubrectBase.X);
-		NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_DLSS_Input_Color_Subrect_Base_Y, ep->InColorSubrectBase.Y);
-		NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_DLSS_Input_Depth_Subrect_Base_X, ep->InDepthSubrectBase.X);
-		NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_DLSS_Input_Depth_Subrect_Base_Y, ep->InDepthSubrectBase.Y);
-		NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_DLSS_Input_MV_SubrectBase_X, ep->InMVSubrectBase.X);
-		NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_DLSS_Input_MV_SubrectBase_Y, ep->InMVSubrectBase.Y);
-		NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_DLSS_Input_Translucency_SubrectBase_X, ep->InTranslucencySubrectBase.X);
-		NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_DLSS_Input_Translucency_SubrectBase_Y, ep->InTranslucencySubrectBase.Y);
-		NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_SubrectBase_X, ep->InBiasCurrentColorSubrectBase.X);
-		NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_SubrectBase_Y, ep->InBiasCurrentColorSubrectBase.Y);
-		NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_DLSS_Output_Subrect_Base_X, ep->InOutputSubrectBase.X);
-		NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_DLSS_Output_Subrect_Base_Y, ep->InOutputSubrectBase.Y);
-		NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, ep->InRenderSubrectDimensions.Width);
-		NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, ep->InRenderSubrectDimensions.Height);
-		NVSDK_NGX_Parameter_SetF(params, NVSDK_NGX_Parameter_DLSS_Pre_Exposure, ep->InPreExposure == 0.0f ? 1.0f : ep->InPreExposure);
-		NVSDK_NGX_Parameter_SetF(params, NVSDK_NGX_Parameter_DLSS_Exposure_Scale, ep->InExposureScale == 0.0f ? 1.0f : ep->InExposureScale);
-		NVSDK_NGX_Parameter_SetI(params, NVSDK_NGX_Parameter_DLSS_Indicator_Invert_X_Axis, ep->InIndicatorInvertXAxis);
-		NVSDK_NGX_Parameter_SetI(params, NVSDK_NGX_Parameter_DLSS_Indicator_Invert_Y_Axis, ep->InIndicatorInvertYAxis);
+		params->Set(NVSDK_NGX_Parameter_Color, ep->Feature.pInColor);
+		params->Set(NVSDK_NGX_Parameter_Output, ep->Feature.pInOutput);
+		params->Set(NVSDK_NGX_Parameter_Depth, ep->pInDepth);
+		params->Set(NVSDK_NGX_Parameter_MotionVectors, ep->pInMotionVectors);
+		params->Set(NVSDK_NGX_Parameter_Jitter_Offset_X, ep->InJitterOffsetX);
+		params->Set(NVSDK_NGX_Parameter_Jitter_Offset_Y, ep->InJitterOffsetY);
+		params->Set(NVSDK_NGX_Parameter_Sharpness, ep->Feature.InSharpness);
+		params->Set(NVSDK_NGX_Parameter_Reset, ep->InReset);
+		params->Set(NVSDK_NGX_Parameter_MV_Scale_X, ep->InMVScaleX == 0.0f ? 1.0f : ep->InMVScaleX);
+		params->Set(NVSDK_NGX_Parameter_MV_Scale_Y, ep->InMVScaleY == 0.0f ? 1.0f : ep->InMVScaleY);
+		params->Set(NVSDK_NGX_Parameter_TransparencyMask, ep->pInTransparencyMask);
+		params->Set(NVSDK_NGX_Parameter_ExposureTexture, ep->pInExposureTexture);
+		params->Set(NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_Mask, ep->pInBiasCurrentColorMask);
+		params->Set(NVSDK_NGX_Parameter_GBuffer_Albedo, ep->GBufferSurface.pInAttrib[NVSDK_NGX_GBUFFER_ALBEDO]);
+		params->Set(NVSDK_NGX_Parameter_GBuffer_Roughness, ep->GBufferSurface.pInAttrib[NVSDK_NGX_GBUFFER_ROUGHNESS]);
+		params->Set(NVSDK_NGX_Parameter_GBuffer_Metallic, ep->GBufferSurface.pInAttrib[NVSDK_NGX_GBUFFER_METALLIC]);
+		params->Set(NVSDK_NGX_Parameter_GBuffer_Specular, ep->GBufferSurface.pInAttrib[NVSDK_NGX_GBUFFER_SPECULAR]);
+		params->Set(NVSDK_NGX_Parameter_GBuffer_Subsurface, ep->GBufferSurface.pInAttrib[NVSDK_NGX_GBUFFER_SUBSURFACE]);
+		params->Set(NVSDK_NGX_Parameter_GBuffer_Normals, ep->GBufferSurface.pInAttrib[NVSDK_NGX_GBUFFER_NORMALS]);
+		params->Set(NVSDK_NGX_Parameter_GBuffer_ShadingModelId, ep->GBufferSurface.pInAttrib[NVSDK_NGX_GBUFFER_SHADINGMODELID]);
+		params->Set(NVSDK_NGX_Parameter_GBuffer_MaterialId, ep->GBufferSurface.pInAttrib[NVSDK_NGX_GBUFFER_MATERIALID]);
+		params->Set(NVSDK_NGX_Parameter_GBuffer_Atrrib_8, ep->GBufferSurface.pInAttrib[8]);
+		params->Set(NVSDK_NGX_Parameter_GBuffer_Atrrib_9, ep->GBufferSurface.pInAttrib[9]);
+		params->Set(NVSDK_NGX_Parameter_GBuffer_Atrrib_10, ep->GBufferSurface.pInAttrib[10]);
+		params->Set(NVSDK_NGX_Parameter_GBuffer_Atrrib_11, ep->GBufferSurface.pInAttrib[11]);
+		params->Set(NVSDK_NGX_Parameter_GBuffer_Atrrib_12, ep->GBufferSurface.pInAttrib[12]);
+		params->Set(NVSDK_NGX_Parameter_GBuffer_Atrrib_13, ep->GBufferSurface.pInAttrib[13]);
+		params->Set(NVSDK_NGX_Parameter_GBuffer_Atrrib_14, ep->GBufferSurface.pInAttrib[14]);
+		params->Set(NVSDK_NGX_Parameter_GBuffer_Atrrib_15, ep->GBufferSurface.pInAttrib[15]);
+		params->Set(NVSDK_NGX_Parameter_TonemapperType, ep->InToneMapperType);
+		params->Set(NVSDK_NGX_Parameter_MotionVectors3D, ep->pInMotionVectors3D);
+		params->Set(NVSDK_NGX_Parameter_IsParticleMask, ep->pInIsParticleMask);
+		params->Set(NVSDK_NGX_Parameter_AnimatedTextureMask, ep->pInAnimatedTextureMask);
+		params->Set(NVSDK_NGX_Parameter_DepthHighRes, ep->pInDepthHighRes);
+		params->Set(NVSDK_NGX_Parameter_Position_ViewSpace, ep->pInPositionViewSpace);
+		params->Set(NVSDK_NGX_Parameter_FrameTimeDeltaInMsec, ep->InFrameTimeDeltaInMsec);
+		params->Set(NVSDK_NGX_Parameter_RayTracingHitDistance, ep->pInRayTracingHitDistance);
+		params->Set(NVSDK_NGX_Parameter_MotionVectorsReflection, ep->pInMotionVectorsReflections);
+		params->Set(NVSDK_NGX_Parameter_DLSS_Input_Color_Subrect_Base_X, ep->InColorSubrectBase.X);
+		params->Set(NVSDK_NGX_Parameter_DLSS_Input_Color_Subrect_Base_Y, ep->InColorSubrectBase.Y);
+		params->Set(NVSDK_NGX_Parameter_DLSS_Input_Depth_Subrect_Base_X, ep->InDepthSubrectBase.X);
+		params->Set(NVSDK_NGX_Parameter_DLSS_Input_Depth_Subrect_Base_Y, ep->InDepthSubrectBase.Y);
+		params->Set(NVSDK_NGX_Parameter_DLSS_Input_MV_SubrectBase_X, ep->InMVSubrectBase.X);
+		params->Set(NVSDK_NGX_Parameter_DLSS_Input_MV_SubrectBase_Y, ep->InMVSubrectBase.Y);
+		params->Set(NVSDK_NGX_Parameter_DLSS_Input_Translucency_SubrectBase_X, ep->InTranslucencySubrectBase.X);
+		params->Set(NVSDK_NGX_Parameter_DLSS_Input_Translucency_SubrectBase_Y, ep->InTranslucencySubrectBase.Y);
+		params->Set(NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_SubrectBase_X, ep->InBiasCurrentColorSubrectBase.X);
+		params->Set(NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_SubrectBase_Y, ep->InBiasCurrentColorSubrectBase.Y);
+		params->Set(NVSDK_NGX_Parameter_DLSS_Output_Subrect_Base_X, ep->InOutputSubrectBase.X);
+		params->Set(NVSDK_NGX_Parameter_DLSS_Output_Subrect_Base_Y, ep->InOutputSubrectBase.Y);
+		params->Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, ep->InRenderSubrectDimensions.Width);
+		params->Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, ep->InRenderSubrectDimensions.Height);
+		params->Set(NVSDK_NGX_Parameter_DLSS_Pre_Exposure, ep->InPreExposure == 0.0f ? 1.0f : ep->InPreExposure);
+		params->Set(NVSDK_NGX_Parameter_DLSS_Exposure_Scale, ep->InExposureScale == 0.0f ? 1.0f : ep->InExposureScale);
+		params->Set(NVSDK_NGX_Parameter_DLSS_Indicator_Invert_X_Axis, ep->InIndicatorInvertXAxis);
+		params->Set(NVSDK_NGX_Parameter_DLSS_Indicator_Invert_Y_Axis, ep->InIndicatorInvertYAxis);
 		return Wrap_EvaluateFeature(ctx, handle, params);
+	}
+
+	// Mirrors NGX_DLSS_GET_OPTIMAL_SETTINGS but uses direct vtable calls instead of dispatch lib functions.
+	// The dispatch lib's NVSDK_NGX_Parameter_Get/Set* functions may silently fail when the dispatch lib
+	// hasn't been initialized through its normal path (which we bypass when calling OptiScaler directly).
+	static NVSDK_NGX_Result Wrap_GET_OPTIMAL_SETTINGS(
+		NVSDK_NGX_Parameter* pInParams,
+		unsigned int InUserSelectedWidth, unsigned int InUserSelectedHeight,
+		NVSDK_NGX_PerfQuality_Value InPerfQualityValue,
+		unsigned int* pOutRenderOptimalWidth, unsigned int* pOutRenderOptimalHeight,
+		unsigned int* pOutRenderMaxWidth, unsigned int* pOutRenderMaxHeight,
+		unsigned int* pOutRenderMinWidth, unsigned int* pOutRenderMinHeight,
+		float* pOutSharpness)
+	{
+		void* Callback = nullptr;
+		pInParams->Get(NVSDK_NGX_Parameter_DLSSOptimalSettingsCallback, &Callback);
+		if (!Callback)
+			return NVSDK_NGX_Result_FAIL_OutOfDate;
+
+		pInParams->Set(NVSDK_NGX_Parameter_Width, InUserSelectedWidth);
+		pInParams->Set(NVSDK_NGX_Parameter_Height, InUserSelectedHeight);
+		pInParams->Set(NVSDK_NGX_Parameter_PerfQualityValue, (int)InPerfQualityValue);
+		pInParams->Set(NVSDK_NGX_Parameter_RTXValue, (int)0);
+
+		auto PFNCallback = (PFN_NVSDK_NGX_DLSS_GetOptimalSettingsCallback)Callback;
+		NVSDK_NGX_Result Res = PFNCallback(pInParams);
+		if (NVSDK_NGX_FAILED(Res))
+			return Res;
+
+		pInParams->Get(NVSDK_NGX_Parameter_OutWidth, pOutRenderOptimalWidth);
+		pInParams->Get(NVSDK_NGX_Parameter_OutHeight, pOutRenderOptimalHeight);
+		*pOutRenderMaxWidth = *pOutRenderOptimalWidth;
+		*pOutRenderMaxHeight = *pOutRenderOptimalHeight;
+		*pOutRenderMinWidth = *pOutRenderOptimalWidth;
+		*pOutRenderMinHeight = *pOutRenderOptimalHeight;
+		pInParams->Get(NVSDK_NGX_Parameter_DLSS_Get_Dynamic_Max_Render_Width, pOutRenderMaxWidth);
+		pInParams->Get(NVSDK_NGX_Parameter_DLSS_Get_Dynamic_Max_Render_Height, pOutRenderMaxHeight);
+		pInParams->Get(NVSDK_NGX_Parameter_DLSS_Get_Dynamic_Min_Render_Width, pOutRenderMinWidth);
+		pInParams->Get(NVSDK_NGX_Parameter_DLSS_Get_Dynamic_Min_Render_Height, pOutRenderMinHeight);
+		pInParams->Get(NVSDK_NGX_Parameter_Sharpness, pOutSharpness);
+		return Res;
 	}
 }
 
@@ -338,15 +382,16 @@ namespace NGX
 
 			// Set all of them for simplicity, these params belong to a specific quality mode anyway.
 			// If we set "NVSDK_NGX_DLSS_Hint_Render_Preset_Default", it should be equal to not setting anything at all.
-			NVSDK_NGX_Parameter_SetUI(runtime_params, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, render_preset);
-			NVSDK_NGX_Parameter_SetUI(runtime_params, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraQuality, render_preset);
-			NVSDK_NGX_Parameter_SetUI(runtime_params, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality, render_preset);
-			NVSDK_NGX_Parameter_SetUI(runtime_params, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced, render_preset);
-			NVSDK_NGX_Parameter_SetUI(runtime_params, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance, render_preset);
-			NVSDK_NGX_Parameter_SetUI(runtime_params, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance, render_preset);
+			// Use direct vtable calls to bypass dispatch lib (which may be uninitialized when OptiScaler is active)
+			runtime_params->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, (unsigned int)render_preset);
+			runtime_params->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraQuality, (unsigned int)render_preset);
+			runtime_params->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality, (unsigned int)render_preset);
+			runtime_params->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced, (unsigned int)render_preset);
+			runtime_params->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance, (unsigned int)render_preset);
+			runtime_params->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance, (unsigned int)render_preset);
 
 #if GAME_FF7_REMAKE // TODO: pass in as param
-			NVSDK_NGX_Parameter_SetUI(runtime_params, NVSDK_NGX_EParameter_Hint_UseFireflySwatter, 1);
+			runtime_params->Set(NVSDK_NGX_EParameter_Hint_UseFireflySwatter, (unsigned int)1);
 #endif
 
 			NVSDK_NGX_DLSS_Create_Params create_params;
@@ -370,7 +415,7 @@ namespace NGX
 			if (NVSDK_NGX_FAILED(create_result))
 			{
 				render_preset = NVSDK_NGX_DLSS_Hint_Render_Preset_Default; // Let's pick the default just to be sure.
-				NVSDK_NGX_Parameter_SetUI(runtime_params, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced, render_preset);
+				runtime_params->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced, (unsigned int)render_preset);
 
 				create_params.Feature.InPerfQualityValue = NVSDK_NGX_PerfQuality_Value_Balanced;
 
@@ -538,7 +583,7 @@ bool NGX::DLSS::UpdateSettings(SR::InstanceData* data, ID3D11DeviceContext* comm
 		unsigned int min_width = 0, max_width = 0, min_height = 0, max_height = 0;
 		float sharpness = 0.f; // Unused
 
-		NVSDK_NGX_Result res = NGX_DLSS_GET_OPTIMAL_SETTINGS(custom_data->capabilities_params, settings_data.output_width, settings_data.output_height, static_cast<NVSDK_NGX_PerfQuality_Value>(i), &optimal_width, &optimal_height, &max_width, &max_height, &min_width, &min_height, &sharpness);
+		NVSDK_NGX_Result res = OptiScalerCompat::Wrap_GET_OPTIMAL_SETTINGS(custom_data->capabilities_params, settings_data.output_width, settings_data.output_height, static_cast<NVSDK_NGX_PerfQuality_Value>(i), &optimal_width, &optimal_height, &max_width, &max_height, &min_width, &min_height, &sharpness);
 
 		if (NVSDK_NGX_SUCCEED(res) && optimal_width != 0 && optimal_height != 0)
 		{
