@@ -48,12 +48,60 @@ jobs:
             }
           }
 
+      - name: Add d3dcompiler and binaries (dxgi, NGX, addon)
+        shell: pwsh
+        run: |
+          # Copy d3dcompiler into the Luma root
+          if (Test-Path 'Shaders/Decompiler/d3dcompiler_47.dll') {
+            Copy-Item -Path 'Shaders/Decompiler/d3dcompiler_47.dll' -Destination 'temp_package\Luma' -Force
+          } elseif (Test-Path 'Shaders/Decompiler/d3dcompiler_47_x32.dll') {
+            Copy-Item -Path 'Shaders/Decompiler/d3dcompiler_47_x32.dll' -Destination 'temp_package\Luma' -Force
+          } else {
+            Write-Host 'd3dcompiler not found; continuing without it.'
+          }
+
+          # Copy ReShade dxgi.dll into temp root if present
+          $rsSrc64 = 'Source/External/reshade/bin/x64/Release/ReShade64.dll'
+          $rsSrc32 = 'Source/External/reshade/bin/Win32/Release/ReShade32.dll'
+          if (Test-Path $rsSrc64) {
+            Copy-Item -Path $rsSrc64 -Destination 'temp_package\dxgi.dll' -Force
+            Write-Host 'Copied ReShade64 to temp_package\dxgi.dll'
+          } elseif (Test-Path $rsSrc32) {
+            Copy-Item -Path $rsSrc32 -Destination 'temp_package\dxgi.dll' -Force
+            Write-Host 'Copied ReShade32 to temp_package\dxgi.dll'
+          } else {
+            Write-Host 'ReShade build not found; skipping dxgi copy.'
+          }
+
+          # Copy NGX DLSS DLL if available (try release then dev)
+          $ngxRel = 'Source/External/NGX/bin/rel/nvngx_dlss.dll'
+          $ngxDev = 'Source/External/NGX/bin/dev/nvngx_dlss.dll'
+          if (Test-Path $ngxRel) {
+            Copy-Item -Path $ngxRel -Destination 'temp_package\nvngx_dlss.dll' -Force
+            Write-Host 'Copied NGX release DLL'
+          } elseif (Test-Path $ngxDev) {
+            Copy-Item -Path $ngxDev -Destination 'temp_package\nvngx_dlss.dll' -Force
+            Write-Host 'Copied NGX dev DLL'
+          } else {
+            Write-Host 'NGX DLSS DLL not found; skipping'
+          }
+
+          # Try to locate an addon file for Luma-Unreal Engine in build outputs or repo
+          $addon = Get-ChildItem -Path . -Recurse -Filter 'Luma-Unreal*.addon' -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($addon) {
+            Copy-Item -Path $addon.FullName -Destination 'temp_package\' -Force
+            Write-Host "Copied addon $($addon.Name) to temp_package"
+          } else {
+            Write-Host 'No Luma-Unreal addon found in repo; skipping addon copy.'
+          }
+
       - name: Create full Luma-Unreal_Engine.zip
         shell: pwsh
         run: |
-          if (-not (Test-Path 'temp_package\Luma')) { Write-Error 'temp_package\Luma missing'; exit 1 }
+          if (-not (Test-Path 'temp_package')) { Write-Error 'temp_package missing'; exit 1 }
           if (Test-Path 'Luma-Unreal_Engine.zip') { Remove-Item 'Luma-Unreal_Engine.zip' -Force }
-          Compress-Archive -Path 'temp_package\Luma\*' -DestinationPath 'Luma-Unreal_Engine.zip' -Force
+          # Package the whole temp_package contents: Luma folder plus dxgi/addon/nvngx if present
+          Compress-Archive -Path 'temp_package\*' -DestinationPath 'Luma-Unreal_Engine.zip' -Force
           Write-Host 'Created Luma-Unreal_Engine.zip'
 
       - name: Create Luma-Unreal_Engine-Test.zip (small-files bundle)
